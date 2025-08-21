@@ -1,13 +1,13 @@
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
-const FormData = require('form-data'); 
+const FormData = require("form-data");
 const axios = require("axios");
 const fs = require("fs");
 const path = require("path");
 const multer = require("multer");
 require("dotenv").config();
-const cors = require('cors');
+const cors = require("cors");
 
 const app = express();
 const server = http.createServer(app);
@@ -32,40 +32,12 @@ const wss = new WebSocket.Server({
 const MAX_CONCURRENT_SESSIONS = 2;
 const activeSessions = new Map();
 
-// ================= CORS MIDDLEWARE =================
-// app.use((req, res, next) => {
-//   // Allow requests from multiple origins
-//   const allowedOrigins = [
-//     'http://127.0.0.1:5500',
-//     'http://localhost:5173',
-//     'http://localhost:3000',
-//     // Add any other origins you need
-//   ];
-  
-//   const origin = req.headers.origin;
-//   if (allowedOrigins.includes(origin)) {
-//     res.header("Access-Control-Allow-Origin", origin);
-//   }
-  
-//   res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-//   res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
-//   res.header("Access-Control-Allow-Credentials", "true");
-  
-//   // Handle preflight requests
-//   if (req.method === 'OPTIONS') {
-//     return res.sendStatus(200);
-//   }
-  
-//   next();
-// });
-// ===================================================
-
 app.use(express.json());
 app.use(express.static("public"));
 
 const SPEECHMATICS_API_URL = "https://asr.api.speechmatics.com/v2";
 const SPEECHMATICS_RT_URL = "wss://eu2.rt.speechmatics.com/v2";
-const SPEECHMATICS_API_KEY = "cL4gU0L1aqoJTCoqi0at6qRyiY3KFiWd";
+const SPEECHMATICS_API_KEY = process.env.SPEECHMATICS_API_KEY;
 
 if (!SPEECHMATICS_API_KEY) {
   console.error("Speechmatics API key missing");
@@ -100,6 +72,7 @@ const upload = multer({
     }
   }
 });
+
 /**
  * -------------------
  * REST: Transcribe file
@@ -218,6 +191,7 @@ app.post("/api/transcribe", upload.single("file"), async (req, res) => {
     });
   }
 });
+
 /**
  * -------------------
  * WebSocket: Real-time transcription
@@ -244,6 +218,7 @@ wss.on("connection", (clientWs, req) => {
     clientWs,
     speechmaticsWs: null,
     closed: false,
+    audioReceived: false, // Track if we've received any audio data
     pingInterval: setInterval(() => {
       if (!session.closed && clientWs.readyState === WebSocket.OPEN) {
         clientWs.ping();
@@ -271,19 +246,46 @@ wss.on("connection", (clientWs, req) => {
 
       speechmaticsWs.on("open", () => {
         console.log(`Speechmatics connected for ${sessionId}`);
+        
+        // Try different audio format configurations
+        const audioFormats = [
+          {
+            type: "raw",
+            sample_rate: 16000,
+            encoding: "pcm_s16le", // 16-bit signed integer (most common)
+          },
+          {
+            type: "raw", 
+            sample_rate: 16000,
+            encoding: "pcm_f32le", // 32-bit float (your current)
+          }
+        ];
+
+        // Use the first format by default, can be made configurable
+        const selectedFormat = audioFormats[0];
+        
         speechmaticsWs.send(
           JSON.stringify({
             message: "StartRecognition",
             transcription_config: {
               language: session.language,
+              diarization: "none",
               operating_point: "enhanced",
+              max_delay_mode: "flexible",
+              max_delay: 1,
               enable_partials: true,
+              enable_entities: true,
             },
-            audio_format: {
-              type: "raw",
-              encoding: "pcm_s16le",
-              sample_rate: 16000,
-            },
+            audio_format: selectedFormat,
+          })
+        );
+
+        // Send acknowledgment to client
+        clientWs.send(
+          JSON.stringify({
+            type: "ready",
+            message: "Ready to receive audio",
+            audio_format: selectedFormat,
           })
         );
       });
@@ -294,7 +296,15 @@ wss.on("connection", (clientWs, req) => {
           const msg = JSON.parse(data);
           console.log(`Speechmatics message [${sessionId}]:`, msg.message);
 
-          if (
+          if (msg.message === "RecognitionStarted") {
+            console.log(`Recognition started for ${sessionId}`);
+            clientWs.send(
+              JSON.stringify({
+                type: "recognition_started",
+                message: "Speech recognition active",
+              })
+            );
+          } else if (
             msg.message === "AddPartialTranscript" ||
             msg.message === "AddTranscript"
           ) {
@@ -305,12 +315,26 @@ wss.on("connection", (clientWs, req) => {
                 transcript,
               })
             );
+          } else if (msg.message === "AudioAdded") {
+            if (!session.audioReceived) {
+              session.audioReceived = true;
+              console.log(`First audio chunk received for ${sessionId}`);
+            }
           } else if (msg.message === "Error") {
             console.error(`Speechmatics error [${sessionId}]:`, msg.reason);
             clientWs.send(
               JSON.stringify({
                 type: "error",
                 message: msg.reason || "Speechmatics error",
+                details: msg,
+              })
+            );
+          } else if (msg.message === "Warning") {
+            console.warn(`Speechmatics warning [${sessionId}]:`, msg.reason);
+            clientWs.send(
+              JSON.stringify({
+                type: "warning", 
+                message: msg.reason || "Speechmatics warning",
               })
             );
           }
@@ -319,10 +343,17 @@ wss.on("connection", (clientWs, req) => {
         }
       });
 
-      speechmaticsWs.on("close", () => {
-        console.log(`Speechmatics closed [${sessionId}]`);
+      speechmaticsWs.on("close", (code, reason) => {
+        console.log(`Speechmatics closed [${sessionId}] - Code: ${code}, Reason: ${reason}`);
         if (!session.closed) {
-          clientWs.close();
+          clientWs.send(
+            JSON.stringify({
+              type: "speechmatics_disconnected",
+              message: "Speechmatics connection closed",
+              code,
+              reason: reason?.toString(),
+            })
+          );
         }
       });
 
@@ -332,22 +363,50 @@ wss.on("connection", (clientWs, req) => {
           clientWs.send(
             JSON.stringify({
               type: "error",
-              message: "Connection error",
+              message: "Speechmatics connection error",
+              details: err.message,
             })
           );
-          clientWs.close();
         }
       });
     } catch (err) {
       console.error(`Setup error [${sessionId}]:`, err);
-      clientWs.close();
+      clientWs.send(
+        JSON.stringify({
+          type: "error",
+          message: "Failed to setup Speechmatics connection",
+          details: err.message,
+        })
+      );
     }
   };
 
   clientWs.on("message", (data) => {
     if (session.closed) return;
+    
+    // Check if this is a text message (configuration) or binary (audio)
+    if (typeof data === 'string' || Buffer.isBuffer(data)) {
+      try {
+        // Try to parse as JSON first (configuration messages)
+        const parsed = JSON.parse(data.toString());
+        console.log(`Received config from client [${sessionId}]:`, parsed);
+        // Handle any client configuration here
+        return;
+      } catch (e) {
+        // Not JSON, treat as audio data
+      }
+    }
+    
+    // Forward audio data to Speechmatics
     if (session.speechmaticsWs?.readyState === WebSocket.OPEN) {
       session.speechmaticsWs.send(data);
+      
+      // Log first audio chunk for debugging
+      if (!session.audioReceived) {
+        console.log(`Forwarding first audio chunk [${sessionId}] - Size: ${data.length} bytes`);
+      }
+    } else {
+      console.warn(`Cannot forward audio - Speechmatics not ready [${sessionId}]`);
     }
   });
 
@@ -356,6 +415,12 @@ wss.on("connection", (clientWs, req) => {
     session.closed = true;
     clearInterval(session.pingInterval);
     if (session.speechmaticsWs) {
+      // Send EndOfStream before closing
+      if (session.speechmaticsWs.readyState === WebSocket.OPEN) {
+        session.speechmaticsWs.send(
+          JSON.stringify({ message: "EndOfStream" })
+        );
+      }
       session.speechmaticsWs.close();
     }
     activeSessions.delete(sessionId);
@@ -376,6 +441,19 @@ wss.on("connection", (clientWs, req) => {
 
 /**
  * -------------------
+ * Health check endpoint
+ * -------------------
+ */
+app.get("/api/health", (req, res) => {
+  res.json({ 
+    status: "ok", 
+    activeSessions: activeSessions.size,
+    maxSessions: MAX_CONCURRENT_SESSIONS 
+  });
+});
+
+/**
+ * -------------------
  * Misc & startup
  * -------------------
  */
@@ -386,9 +464,11 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`Server is running`);
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Active sessions: 0/${MAX_CONCURRENT_SESSIONS}`);
 });
 
+
 app.get('/' ,(req,res) =>{
-  res.send('voice-AI')
+  res.send('voice-AI Working...')
 })

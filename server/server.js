@@ -29,7 +29,7 @@ const wss = new WebSocket.Server({
   },
 });
 
-const MAX_CONCURRENT_SESSIONS = 2;
+const MAX_CONCURRENT_SESSIONS = 20;
 const activeSessions = new Map();
 
 app.use(express.json());
